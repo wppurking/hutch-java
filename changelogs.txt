@@ -1,3 +1,6 @@
+v1.3.0
+* 增加基于 redis 的 schedule publish 支持
+
 v1.2.0
 * 为 HutchConsumer 的 onMessage 增加可抛出异常, 自定义流程控制什么情况可直接触发 ErrorHandler
 * 增加申明 quorum queue 队列, 使用 rabbitmq 的分布式队列进行任务处理

@@ -51,6 +51,10 @@ public class HutchConfig {
   @ConfigItem(defaultValue = "5672")
   public int port;
 
+  /** 用于 schedule 的 Redis URL */
+  @ConfigItem(defaultValue = "redis://localhost:6379")
+  public String redisUrl;
+
   /** 从 IOC 中获取默认的那个 Executors */
   public static ExecutorService getSharedExecutor() {
     try {

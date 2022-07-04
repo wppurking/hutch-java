@@ -19,6 +19,13 @@ import java.util.Map;
  *     method</a>
  */
 public interface HutchConsumer {
+  /** 静态方法提供通过 class 寻找 HutchConsumer 实例 */
+  static HutchConsumer get(Class<? extends HutchConsumer> clazz) {
+    return Hutch.consumers().stream()
+        .filter(clazz::isInstance)
+        .findFirst()
+        .orElse(null);
+  }
 
   /** 静态方法提供 routing key 计算支持 */
   static String rk(Class<? extends HutchConsumer> clazz) {
@@ -31,7 +38,7 @@ public interface HutchConsumer {
         .replace("__subclass", "");
   }
 
-  /** 每一个 Channel 能够拥有的 prefech, 避免单个 channel 积累太多任务. default: 2 */
+  /** 每一个 Channel 能够拥有的 prefetch, 避免单个 channel 积累太多任务. default: 2 */
   default int prefetch() {
     return 2;
   }
@@ -39,6 +46,11 @@ public interface HutchConsumer {
   /** 多少并发线程. default: 1 */
   default int concurrency() {
     return 1;
+  }
+
+  /** 主动限流的参数 */
+  default Threshold threshold() {
+    return null;
   }
 
   /** 绑定的队列名称(down case). default: <Hutch.name>_clazz.simpleName */

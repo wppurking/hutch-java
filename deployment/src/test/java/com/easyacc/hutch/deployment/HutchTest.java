@@ -21,11 +21,12 @@ class HutchTest {
           .overrideConfigKey("quarkus.application.name", "hutch-app")
           .overrideConfigKey("quarkus.hutch.name", "lake_web")
           .overrideConfigKey("quarkus.hutch.virtual-host", "test")
-          //                    .overrideConfigKey("quarkus.log.level", "debug")
+          .overrideConfigKey("quarkus.hutch.redis-url", "redis://localhost:6379")
+          // .overrideConfigKey("quarkus.log.level", "debug")
           .withApplicationRoot(jar -> jar.addClass(AbcConsumer.class).addClass(BbcConsumer.class));
 
-  @Inject AbcConsumer abcConsumer;
   @Inject HutchConfig config;
+  @Inject AbcConsumer abcConsumer;
 
   @Test
   void testHutchConsumerAllInCDI() {
@@ -125,6 +126,23 @@ class HutchTest {
     TimeUnit.SECONDS.sleep(2);
     assertThat(AbcConsumer.Timers.get()).isEqualTo(a);
     TimeUnit.SECONDS.sleep(6);
+    assertThat(AbcConsumer.Timers.get()).isEqualTo(a + 1);
+    h.stop();
+  }
+
+  @Test
+  void testPublishWithSchedule() throws InterruptedException {
+    HutchConfig.getErrorHandlers().clear();
+    HutchConfig.getErrorHandlers().add(new NoDelayMaxRetry());
+
+    var h = CDI.current().select(Hutch.class).get();
+    h.start();
+    Hutch.publishWithSchedule(AbcConsumer.class, "ccc");
+
+    var a = AbcConsumer.Timers.get();
+    assertThat(AbcConsumer.Timers.get()).isEqualTo(a);
+
+    TimeUnit.SECONDS.sleep(2);
     assertThat(AbcConsumer.Timers.get()).isEqualTo(a + 1);
     h.stop();
   }

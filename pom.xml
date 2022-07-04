@@ -6,7 +6,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>com.easyacc</groupId>
   <artifactId>hutch-parent</artifactId>
-  <version>1.2.0</version>
+  <version>1.3.6</version>
   <packaging>pom</packaging>
   <name>Hutch - Parent</name>
   <modules>
@@ -40,7 +40,7 @@
     <repository>
       <id>github</id>
       <name>GitHub OWNER Apache Maven Packages</name>
-      <url>https://maven.pkg.github.com/wppurking/hutch-java</url>
+      <url>https://maven.pkg.github.com/kenyonduan/hutch-java</url>
     </repository>
   </distributionManagement>
   <build>

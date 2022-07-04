@@ -4,11 +4,14 @@ import com.easyacc.hutch.config.HutchConfig;
 import com.easyacc.hutch.core.HutchConsumer;
 import com.easyacc.hutch.core.Message;
 import com.easyacc.hutch.core.MessageProperties;
+import com.easyacc.hutch.scheduler.HyenaJob;
 import com.easyacc.hutch.support.DefaultMessagePropertiesConverter;
 import com.easyacc.hutch.support.MessagePropertiesConverter;
 import com.easyacc.hutch.util.HutchUtils;
 import com.easyacc.hutch.util.HutchUtils.Gradient;
 import com.easyacc.hutch.util.RabbitUtils;
+import com.easyacc.hutch.util.RedisUtils;
+import com.easyacc.hutch.util.SchedulerUtils;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -16,22 +19,35 @@ import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.rabbitmq.client.AMQP.BasicProperties;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Connection;
+import io.lettuce.core.RedisClient;
+import io.lettuce.core.api.StatefulRedisConnection;
 import io.quarkus.runtime.LaunchMode;
 import java.io.IOException;
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import javax.enterprise.inject.spi.CDI;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
+import org.quartz.JobBuilder;
+import org.quartz.JobDataMap;
+import org.quartz.Scheduler;
+import org.quartz.SimpleScheduleBuilder;
+import org.quartz.TriggerBuilder;
+import org.quartz.impl.StdSchedulerFactory;
 import org.slf4j.Logger;
 
 /**
@@ -63,6 +79,7 @@ public class Hutch implements IHutch {
   private static volatile Hutch currentHutch;
 
   @Setter private static ObjectMapper objectMapper;
+  private static Set<HutchConsumer> consumers;
 
   private final Map<String, List<SimpleConsumer>> hutchConsumers;
 
@@ -74,6 +91,9 @@ public class Hutch implements IHutch {
   private Connection conn;
   /** 将 consumer 的 connection 与其他的区分开 */
   private Connection connForConsumer;
+
+  private Scheduler scheduler;
+  @Getter private StatefulRedisConnection<String, String> redisConnection;
 
   @Getter private boolean isStarted = false;
 
@@ -149,6 +169,7 @@ public class Hutch implements IHutch {
   public static void publishJson(Class<? extends HutchConsumer> consumer, Object msg) {
     publishJson(HutchConsumer.rk(consumer), msg);
   }
+
   /** 直接当做 JSON 发送 */
   public static void publishJson(String routingKey, Object msg) {
     var props =
@@ -190,6 +211,41 @@ public class Hutch implements IHutch {
     } catch (JsonProcessingException e) {
       Hutch.log().error("publishJson error", e);
     }
+  }
+
+  /** 直接使用 JSON 进行 schedule publish */
+  public static void publishJsonWithSchedule(Class<? extends HutchConsumer> consumer, Object msg) {
+    try {
+      publishWithSchedule(consumer, om().writeValueAsString(msg));
+    } catch (JsonProcessingException e) {
+      Hutch.log().error("publishJson error", e);
+    }
+  }
+
+  /** 进行 schedule publish */
+  public static void publishWithSchedule(Class<? extends HutchConsumer> consumer, String msg) {
+    // 寻找到对应的 Consumer 实例
+    var hc = HutchConsumer.get(consumer);
+    if (hc == null) {
+      throw new IllegalStateException("未找到 HutchConsumer 实例!" + consumer);
+    }
+
+    var threshold = hc.threshold();
+    if (threshold == null) {
+      throw new IllegalStateException("未找到 threshold 参数!" + hc.getClass());
+    }
+
+    // 使用 msg 计算出 key 作为 redis key 的 suffix
+    var key =
+        Stream.of(hc.queue(), threshold.key(msg))
+            .filter(Objects::nonNull)
+            .filter(Predicate.not(String::isBlank))
+            .collect(Collectors.joining("."));
+    Hutch.current()
+        .getRedisConnection()
+        .sync()
+        // 使用当前时间作为 score
+        .zadd(key, Timestamp.valueOf(LocalDateTime.now()).getTime(), msg);
   }
 
   /**
@@ -239,17 +295,20 @@ public class Hutch implements IHutch {
     return Hutch.objectMapper;
   }
 
+  /** Hutch 所有的 HutchConsumer 实例 */
   public static Set<HutchConsumer> consumers() {
-    var beans = CDI.current().getBeanManager().getBeans(HutchConsumer.class);
-    var queues = new HashSet<HutchConsumer>();
-    for (var bean : beans) {
-      var hco = HutchUtils.findHutchConsumerBean(bean.getBeanClass());
-      if (hco.isEmpty()) {
-        continue;
+    if (Hutch.consumers == null) {
+      Hutch.consumers = new HashSet<>();
+      var beans = CDI.current().getBeanManager().getBeans(HutchConsumer.class);
+      for (var bean : beans) {
+        var hco = HutchUtils.findHutchConsumerBean(bean.getBeanClass());
+        if (hco.isEmpty()) {
+          continue;
+        }
+        Hutch.consumers.add(hco.get());
       }
-      queues.add(hco.get());
     }
-    return queues;
+    return Hutch.consumers;
   }
 
   public static Set<String> queues() {
@@ -270,13 +329,19 @@ public class Hutch implements IHutch {
     }
     try {
       connect();
-      declearExchanges();
-      declearScheduleQueues();
-      declearhutchConsumerQueues();
+      declareExchanges();
+      declareScheduleQueues();
+      declareHutchConsumerQueues();
     } finally {
       currentHutch = this;
+
+      // 确保 currentHutch 不为 null
+      initScheduler();
+      initRedisClient();
+      initHutchConsumerTriggers();
       this.isStarted = true;
     }
+
     return this;
   }
 
@@ -293,7 +358,7 @@ public class Hutch implements IHutch {
     this.ch = conn.createChannel();
   }
 
-  protected void declearExchanges() {
+  protected void declareExchanges() {
     try {
       this.ch.exchangeDeclare(HUTCH_EXCHANGE, "topic", true);
       this.ch.exchangeDeclare(HUTCH_SCHEDULE_EXCHANGE, "topic", true);
@@ -303,7 +368,7 @@ public class Hutch implements IHutch {
     }
   }
 
-  protected void declearScheduleQueues() {
+  protected void declareScheduleQueues() {
     // 初始化 delay queue 相关的信息
     var delayQueueArgs = new HashMap<String, Object>();
     // TODO: 可以考虑 x-message-ttl 为每个队列自己的超时时间, 这里设置成 30 天没有太大意义. (需要与 hutch-schedule 进行迁移)
@@ -322,7 +387,7 @@ public class Hutch implements IHutch {
     }
   }
 
-  protected void declearhutchConsumerQueues() {
+  protected void declareHutchConsumerQueues() {
     var queues = Hutch.queues();
     log.info(
         "Start Hutch ({}) with queues({}): {}",
@@ -330,13 +395,13 @@ public class Hutch implements IHutch {
         queues.size(),
         queues);
     for (var hc : Hutch.consumers()) {
-      declearHutchConsumQueue(hc);
+      declareHutchConsumerQueue(hc);
       initHutchConsumer(hc);
       log.debug("Connect to {}", hc.queue());
     }
   }
 
-  protected void declearHutchConsumQueue(HutchConsumer hc) {
+  protected void declareHutchConsumerQueue(HutchConsumer hc) {
     try {
       var args = new HashMap<>(hc.queueArguments());
       if (this.config.quorum) {
@@ -357,6 +422,50 @@ public class Hutch implements IHutch {
       scl.add(consumeHutchConsumer(hc));
     }
     this.hutchConsumers.put(hc.queue(), scl);
+  }
+
+  /** 为所有的 Consumer 初始化 Job Trigger */
+  protected void initHutchConsumerTriggers() {
+    for (var hc : Hutch.consumers()) {
+      initHutchConsumerTrigger(hc);
+    }
+  }
+
+  /** 初始化 Job Trigger */
+  @SneakyThrows
+  protected void initHutchConsumerTrigger(HutchConsumer hc) {
+    var threshold = hc.threshold();
+    if (threshold != null) {
+      var job =
+          JobBuilder.newJob(HyenaJob.class)
+              .withIdentity(hc.queue(), Hutch.name())
+              .usingJobData(new JobDataMap(Map.of("consumerClass", hc.getClass())))
+              .build();
+      var trigger =
+          TriggerBuilder.newTrigger()
+              .withIdentity(hc.queue(), Hutch.name())
+              .startNow()
+              .withSchedule(
+                  SimpleScheduleBuilder.simpleSchedule()
+                      .withIntervalInSeconds(threshold.interval())
+                      .repeatForever())
+              .build();
+      this.scheduler.scheduleJob(job, trigger);
+    }
+  }
+
+  /** 初始化 Quartz Scheduler */
+  @SneakyThrows
+  protected void initScheduler() {
+    this.scheduler = new StdSchedulerFactory().getScheduler();
+    this.scheduler.start();
+  }
+
+  /** 初始化 Redis Connection */
+  protected void initRedisClient() {
+    if (this.config.redisUrl != null) {
+      this.redisConnection = RedisClient.create(this.config.redisUrl).connect();
+    }
   }
 
   /**
@@ -380,6 +489,9 @@ public class Hutch implements IHutch {
         this.hutchConsumers.clear();
       }
     } finally {
+      SchedulerUtils.clear(this.scheduler);
+      RedisUtils.close(this.redisConnection);
+
       RabbitUtils.closeChannel(this.ch);
       RabbitUtils.closeConnection(this.conn);
       RabbitUtils.closeConnection(this.connForConsumer);
